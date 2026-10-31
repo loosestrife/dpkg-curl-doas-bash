@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# (1) kill apt-add-respository for security reasons
+# (2) replace sudo with doas for security reasons
+# (3) dpkg-curl-doas-bash for security reasons
+
+set -euo pipefail
+
+usage() {
+    echo "Usage: $(basename "$0") <installer_url> [pkg_name] [pkg_version]"
+    echo "Example: $(basename "$0") https://pixi.sh/install.sh pixi 1.0.0"
+    exit 1
+}
+
+[ $# -lt 1 ] && usage
+
+INSTALL_URL="$1"
+PKG_NAME="${2:-captured-payload}"
+PKG_VERSION="${3:-1.0.0}"
+IMAGE="ubuntu:latest"
+BUILD_ID="deb-build-$RANDOM"
+WORK_DIR=$(mktemp -d "/tmp/${BUILD_ID}.XXXXXX")
+
+cleanup() {
+    podman rm -f "${BUILD_ID}-base" "${BUILD_ID}-run" >/dev/null 2>&1 || true
+    podman rmi -f "${BUILD_ID}-base-img" >/dev/null 2>&1 || true
+    rm -rf "$WORK_DIR"
+}
+trap cleanup EXIT
+
+echo "==> 1. Bootstrapping baseline container (${IMAGE})..."
+podman run --name "${BUILD_ID}-base" -d "$IMAGE" sleep 300 >/dev/null
+
+podman exec -u root "${BUILD_ID}-base" bash -c '
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update && apt-get install -y curl ca-certificates xz-utils bzip2
+    
+    # Universal elevation passthrough
+    for cmd in doas sudo; do
+        cat << "EOF" > "/usr/local/bin/${cmd}"
+#!/bin/sh
+exec "$@"
+EOF
+        chmod +x "/usr/local/bin/${cmd}"
+    done
+
+    # Prevent failure if scripts try to invoke daemon management
+    cat << "EOF" > /usr/local/bin/systemctl
+#!/bin/sh
+exit 0
+EOF
+    chmod +x /usr/local/bin/systemctl
+'
+
+podman commit "${BUILD_ID}-base" "${BUILD_ID}-base-img" >/dev/null
+podman rm -f "${BUILD_ID}-base" >/dev/null
+
+echo "==> 2. Running installer..."
+# Run vanilla: no tool-specific environment overrides
+podman run --name "${BUILD_ID}-run" "${BUILD_ID}-base-img" bash -c "
+    curl -fsSL '${INSTALL_URL}' | bash
+"
+
+echo "==> 3. Capturing filesystem delta..."
+STAGING_DIR="${WORK_DIR}/pkg-root"
+mkdir -p "${STAGING_DIR}/DEBIAN"
+
+# Extract modified/created paths, ignoring temporary files and shell config files
+podman diff "${BUILD_ID}-run" | awk '$1 ~ /^[AC]$/ {print $2}' | \
+    grep -vE '^/(tmp|var/cache|var/log|var/lib/apt|etc/ld\.so\.cache|\.wh\.)' | \
+    grep -vE '^/root/(\.bashrc|\.profile|\.bash_history|\.zshrc|\.cache|\.local/state)' \
+    > "${WORK_DIR}/filelist.txt" || true
+
+if [ ! -s "${WORK_DIR}/filelist.txt" ]; then
+    echo "Error: Installer made no captured filesystem changes." >&2
+    exit 1
+fi
+
+# Extract into staging area
+podman start "${BUILD_ID}-run" >/dev/null
+podman exec -i "${BUILD_ID}-run" tar -cf - --no-recursion -T - < "${WORK_DIR}/filelist.txt" | \
+    tar -xf - -C "$STAGING_DIR"
+podman stop "${BUILD_ID}-run" >/dev/null
+
+echo "==> 4. Normalizing to Debian filesystem hierarchy (/usr)..."
+
+# Case A: If files were installed to /usr/local, shift them to /usr
+if [ -d "${STAGING_DIR}/usr/local" ]; then
+    mkdir -p "${STAGING_DIR}/usr"
+    cp -a "${STAGING_DIR}/usr/local/." "${STAGING_DIR}/usr/"
+    rm -rf "${STAGING_DIR}/usr/local"
+fi
+
+# Case B: If files were dumped into /root, migrate them out
+if [ -d "${STAGING_DIR}/root" ]; then
+    mkdir -p "${STAGING_DIR}/usr/bin"
+    
+    # Check if there are directories in /root (e.g., /root/.pixi)
+    find "${STAGING_DIR}/root" -mindepth 1 -maxdepth 1 -type d | while read -r appdir; do
+        dirname="$(basename "$appdir")"
+        clean_name="${dirname#.}" # strip leading dot: .pixi -> pixi
+        
+        # Move internal tree to /usr/lib/<pkg>
+        mkdir -p "${STAGING_DIR}/usr/lib"
+        mv "$appdir" "${STAGING_DIR}/usr/lib/${clean_name}"
+        
+        # Symlink any executables found inside it into /usr/bin
+        find "${STAGING_DIR}/usr/lib/${clean_name}" -type f -perm /111 | while read -r binary; do
+            bin_name="$(basename "$binary")"
+            ln -rs "$binary" "${STAGING_DIR}/usr/bin/${bin_name}"
+        done
+    done
+    
+    # Catch any loose executables left behind directly in /root
+    find "${STAGING_DIR}/root" -type f -perm /111 | while read -r loose_bin; do
+        mv "$loose_bin" "${STAGING_DIR}/usr/bin/"
+    done
+    
+    rm -rf "${STAGING_DIR}/root"
+fi
+
+echo "==> 5. Building Debian package..."
+cat << EOF > "${STAGING_DIR}/DEBIAN/control"
+Package: ${PKG_NAME}
+Version: ${PKG_VERSION}
+Section: utils
+Priority: optional
+Architecture: amd64
+Maintainer: $(whoami) <$(whoami)@$(hostname)>
+Description: Automatically packaged payload from ${INSTALL_URL}
+EOF
+
+cat << 'EOF' > "${STAGING_DIR}/DEBIAN/postinst"
+#!/bin/sh
+set -e
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+fi
+if command -v ldconfig >/dev/null 2>&1; then
+    ldconfig || true
+fi
+EOF
+chmod 755 "${STAGING_DIR}/DEBIAN/postinst"
+
+OUTPUT_DEB="${PKG_NAME}_${PKG_VERSION}_amd64.deb"
+dpkg-deb --build --root-owner-group "$STAGING_DIR" "$OUTPUT_DEB"
+
+echo "==> Success! Package built: $(pwd)/${OUTPUT_DEB}"
+dpkg -c "$OUTPUT_DEB"
